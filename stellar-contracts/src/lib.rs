@@ -1,6 +1,55 @@
 #![no_std]
 #![allow(clippy::too_many_arguments)]
 
+use soroban_sdk::contracterror;
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ContractError {
+    PetNotFound = 1,
+    VetNotFound = 2,
+    VetNotVerified = 3,
+    VetAlreadyRegistered = 4,
+    LicenseAlreadyRegistered = 5,
+    AdminAlreadySet = 6,
+    AdminNotSet = 7,
+    NotAdmin = 8,
+    NotPetOwner = 9,
+    InvalidThreshold = 10,
+    InvokerNotInAdminList = 11,
+    TagAlreadyLinked = 12,
+    AlertNotFound = 13,
+    AlertNotActive = 14,
+    ProposalNotFound = 15,
+    ProposalAlreadyExecuted = 16,
+    ProposalExpired = 17,
+    ThresholdNotMet = 18,
+    MultisigNotConfigured = 19,
+    MultisigNotEnabled = 20,
+    NotAuthorizedSigner = 21,
+    AlreadySigned = 22,
+    CustodyNotFound = 23,
+    MedicationNotFound = 24,
+    InvalidRating = 25,
+    DuplicateReview = 26,
+    InvalidIpfsHash = 27,
+    EmptyFilename = 28,
+    EmptyFileType = 29,
+    ZeroFileSize = 30,
+    TooManyAttachments = 31,
+    InputTooLong = 32,
+    TooManyMedications = 33,
+    SlotAlreadyBooked = 34,
+    NotPetOwnerForConsent = 35,
+    ConsentAlreadyRevoked = 36,
+    NotConsentOwner = 37,
+    CounterOverflow = 38,
+    UnauthorizedBooker = 39,
+    AdminAlreadyApproved = 40,
+    NotAuthorizedResponder = 41,
+}
+
 #[contracttype]
 pub enum InsuranceKey {
     Policy(u64),
@@ -79,7 +128,8 @@ mod test_book_slot;
 
 use soroban_sdk::xdr::{FromXdr, ToXdr};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec,
+    contract, contractimpl, contracttype, panic_with_error, Address, Bytes, BytesN, Env, String,
+    Symbol, Vec,
 };
 
 #[contracttype]
@@ -547,7 +597,10 @@ pub enum DataKey {
 
     // Medication keys
     // Lost Pet Alert System keys
-    EmergencyAccessLogs(u64), // pet_id -> Vec<EmergencyAccessLog>
+    EmergencyAccessLogs(u64),          // pet_id -> Vec<EmergencyAccessLog>
+    EmergencyResponder((u64, Address)), // (pet_id, responder) -> bool
+    EmergencyResponderCount(u64),       // pet_id -> count
+    EmergencyResponderIndex((u64, u64)), // (pet_id, index) -> Address
 }
 
 #[contracttype]
@@ -2847,6 +2900,75 @@ impl PetChainContract {
         }
         history
     }
+    // --- EMERGENCY RESPONDER ALLOWLIST ---
+
+    /// Add an authorized emergency responder for a pet. Only the pet owner can call this.
+    pub fn add_emergency_responder(env: Env, pet_id: u64, responder: Address) {
+        let pet: Pet = env
+            .storage()
+            .instance()
+            .get(&DataKey::Pet(pet_id))
+            .expect("Pet not found");
+        pet.owner.require_auth();
+
+        let key = DataKey::EmergencyResponder((pet_id, responder.clone()));
+        if env.storage().instance().get::<DataKey, bool>(&key).unwrap_or(false) {
+            return; // already added, idempotent
+        }
+        env.storage().instance().set(&key, &true);
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EmergencyResponderCount(pet_id))
+            .unwrap_or(0);
+        let new_count = safe_increment(count);
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyResponderCount(pet_id), &new_count);
+        env.storage().instance().set(
+            &DataKey::EmergencyResponderIndex((pet_id, new_count)),
+            &responder,
+        );
+    }
+
+    /// Remove an authorized emergency responder for a pet. Only the pet owner can call this.
+    pub fn remove_emergency_responder(env: Env, pet_id: u64, responder: Address) {
+        let pet: Pet = env
+            .storage()
+            .instance()
+            .get(&DataKey::Pet(pet_id))
+            .expect("Pet not found");
+        pet.owner.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyResponder((pet_id, responder)), &false);
+    }
+
+    /// Check whether `caller` is authorized to read emergency data for `pet_id`.
+    /// The pet owner and any active responder in the allowlist are authorized.
+    fn require_emergency_access(env: &Env, pet_id: u64, caller: &Address) {
+        let pet: Pet = env
+            .storage()
+            .instance()
+            .get(&DataKey::Pet(pet_id))
+            .expect("Pet not found");
+
+        if &pet.owner == caller {
+            return;
+        }
+
+        let is_responder = env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::EmergencyResponder((pet_id, caller.clone())))
+            .unwrap_or(false);
+
+        if !is_responder {
+            panic_with_error!(env, ContractError::NotAuthorizedResponder);
+        }
+    }
+
     // --- EMERGENCY CONTACTS ---
     pub fn set_emergency_contacts(
         env: Env,
@@ -2893,7 +3015,10 @@ impl PetChainContract {
         }
     }
 
-    pub fn get_emergency_info(env: Env, pet_id: u64) -> EmergencyInfo {
+    pub fn get_emergency_info(env: Env, pet_id: u64, caller: Address) -> EmergencyInfo {
+        caller.require_auth();
+        Self::require_emergency_access(&env, pet_id, &caller);
+
         if let Some(pet) = env
             .storage()
             .instance()
@@ -2944,7 +3069,7 @@ impl PetChainContract {
             // Log the emergency access
             let log = EmergencyAccessLog {
                 pet_id,
-                accessed_by: env.current_contract_address(),
+                accessed_by: caller,
                 timestamp: env.ledger().timestamp(),
             };
 
@@ -2969,8 +3094,11 @@ impl PetChainContract {
         }
     }
 
-    /// Get emergency contacts for a pet (publicly accessible - no auth required for emergency responders)
-    pub fn get_emergency_contacts(env: Env, pet_id: u64) -> Vec<EmergencyContact> {
+    /// Get emergency contacts for a pet. Requires caller to be the owner or an authorized responder.
+    pub fn get_emergency_contacts(env: Env, pet_id: u64, caller: Address) -> Vec<EmergencyContact> {
+        caller.require_auth();
+        Self::require_emergency_access(&env, pet_id, &caller);
+
         if let Some(pet) = env
             .storage()
             .instance()

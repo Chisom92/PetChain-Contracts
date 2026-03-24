@@ -2,7 +2,7 @@ use crate::*;
 use soroban_sdk::{testutils::Address as _, Address, Env, String, Vec};
 
 #[test]
-fn test_public_emergency_access() {
+fn test_owner_can_read_emergency_info() {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, PetChainContract);
@@ -19,7 +19,7 @@ fn test_public_emergency_access() {
         &String::from_str(&env, "Golden"),
         &25u32,
         &None,
-        &PrivacyLevel::Private, // Even if private, emergency access should work
+        &PrivacyLevel::Private,
     );
 
     let mut contacts = Vec::new(&env);
@@ -37,11 +37,6 @@ fn test_public_emergency_access() {
         severity: String::from_str(&env, "High"),
         is_critical: true,
     });
-    allergies.push_back(Allergy {
-        name: String::from_str(&env, "Pollen"),
-        severity: String::from_str(&env, "Low"),
-        is_critical: false,
-    });
 
     client.set_emergency_contacts(
         &pet_id,
@@ -50,9 +45,8 @@ fn test_public_emergency_access() {
         &String::from_str(&env, "Critical medical condition!"),
     );
 
-    // Set responder (no owner auth needed)
-    env.mock_all_auths(); // Clear auths
-    let info = client.get_emergency_info(&pet_id);
+    // Owner can always read their own pet's emergency info
+    let info = client.get_emergency_info(&pet_id, &owner);
 
     assert_eq!(info.pet_id, pet_id);
     assert_eq!(info.species, String::from_str(&env, "Dog"));
@@ -64,13 +58,14 @@ fn test_public_emergency_access() {
 }
 
 #[test]
-fn test_emergency_data_filtering() {
+fn test_authorized_responder_can_read_emergency_info() {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, PetChainContract);
     let client = PetChainContractClient::new(&env, &contract_id);
 
     let owner = Address::generate(&env);
+    let responder = Address::generate(&env);
     let pet_id = client.register_pet(
         &owner,
         &String::from_str(&env, "Rex"),
@@ -103,29 +98,31 @@ fn test_emergency_data_filtering() {
         &String::from_str(&env, "Needs daily medication"),
     );
 
-    let info = client.get_emergency_info(&pet_id);
+    // Owner grants responder access
+    client.add_emergency_responder(&pet_id, &responder);
 
-    // Should only have the critical allergy
+    let info = client.get_emergency_info(&pet_id, &responder);
+
+    // Only critical allergy returned
     assert_eq!(info.allergies.len(), 1);
     assert_eq!(
         info.allergies.get(0).unwrap().name,
         String::from_str(&env, "Penicillin")
     );
     assert!(info.allergies.get(0).unwrap().is_critical);
-
-    // Critical alert should be present
     assert_eq!(info.critical_alerts.len(), 1);
 }
 
 #[test]
-#[ignore = "Requires Allergy struct implementation"]
-fn test_emergency_logging() {
+#[should_panic(expected = "NotAuthorizedResponder")]
+fn test_unauthorized_get_emergency_info_fails() {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, PetChainContract);
     let client = PetChainContractClient::new(&env, &contract_id);
 
     let owner = Address::generate(&env);
+    let stranger = Address::generate(&env);
     let pet_id = client.register_pet(
         &owner,
         &String::from_str(&env, "Luna"),
@@ -139,13 +136,88 @@ fn test_emergency_logging() {
         &PrivacyLevel::Public,
     );
 
-    // Initial log state (could check storage directly)
-    // Actually, I'll use the client to call get_emergency_info multiple times
-    client.get_emergency_info(&pet_id);
-    client.get_emergency_info(&pet_id);
-    client.get_emergency_info(&pet_id);
+    client.set_emergency_contacts(
+        &pet_id,
+        &Vec::new(&env),
+        &Vec::new(&env),
+        &String::from_str(&env, ""),
+    );
 
-    // Verify logs in storage
+    // Stranger not in allowlist — must panic
+    client.get_emergency_info(&pet_id, &stranger);
+}
+
+#[test]
+#[should_panic(expected = "NotAuthorizedResponder")]
+fn test_removed_responder_cannot_read_emergency_info() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, PetChainContract);
+    let client = PetChainContractClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let responder = Address::generate(&env);
+    let pet_id = client.register_pet(
+        &owner,
+        &String::from_str(&env, "Milo"),
+        &String::from_str(&env, "2022-06-01"),
+        &Gender::Male,
+        &Species::Dog,
+        &String::from_str(&env, "Poodle"),
+        &String::from_str(&env, "White"),
+        &10u32,
+        &None,
+        &PrivacyLevel::Public,
+    );
+
+    client.set_emergency_contacts(
+        &pet_id,
+        &Vec::new(&env),
+        &Vec::new(&env),
+        &String::from_str(&env, ""),
+    );
+
+    client.add_emergency_responder(&pet_id, &responder);
+    client.remove_emergency_responder(&pet_id, &responder);
+
+    // Removed responder must be rejected
+    client.get_emergency_info(&pet_id, &responder);
+}
+
+#[test]
+fn test_emergency_logging_records_caller() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, PetChainContract);
+    let client = PetChainContractClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let responder = Address::generate(&env);
+    let pet_id = client.register_pet(
+        &owner,
+        &String::from_str(&env, "Luna"),
+        &String::from_str(&env, "2021-03-20"),
+        &Gender::Female,
+        &Species::Cat,
+        &String::from_str(&env, "Siamese"),
+        &String::from_str(&env, "Cream"),
+        &8u32,
+        &None,
+        &PrivacyLevel::Public,
+    );
+
+    client.set_emergency_contacts(
+        &pet_id,
+        &Vec::new(&env),
+        &Vec::new(&env),
+        &String::from_str(&env, ""),
+    );
+
+    client.add_emergency_responder(&pet_id, &responder);
+
+    client.get_emergency_info(&pet_id, &owner);
+    client.get_emergency_info(&pet_id, &responder);
+
     let log_key = DataKey::EmergencyAccessLogs(pet_id);
     let logs: Vec<EmergencyAccessLog> = env.as_contract(&contract_id, || {
         env.storage()
@@ -154,7 +226,7 @@ fn test_emergency_logging() {
             .unwrap_or(Vec::new(&env))
     });
 
-    assert_eq!(logs.len(), 3);
-    assert_eq!(logs.get(0).unwrap().pet_id, pet_id);
-    assert!(logs.get(0).unwrap().timestamp > 0);
+    assert_eq!(logs.len(), 2);
+    assert_eq!(logs.get(0).unwrap().accessed_by, owner);
+    assert_eq!(logs.get(1).unwrap().accessed_by, responder);
 }
